@@ -22,7 +22,10 @@ struct hashmap *hashmap_create(void (*entry_deletion_processor)(void *value)) {
  	 	return NULL;
  	}
 	hashmap->entry_deletion_processor = entry_deletion_processor;
-	pthread_mutex_init(&(hashmap->mutex), NULL);
+	if (pthread_mutex_init(&(hashmap->mutex), NULL) != 0) {
+		free(hashmap);
+		return NULL;
+	}
 	return hashmap;
 }
 void hashmap_destroy(struct hashmap *hashmap) {
