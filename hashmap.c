@@ -31,6 +31,22 @@ struct hashmap *hashmap_create(void (*entry_deletion_processor)(void *value)) {
 	}
 	return hashmap;
 }
+
+void locked_hashmap_destroy(struct locked_hashmap **locked_hashmap) {
+	struct hashmap *hashmap = HASHMAP_LH_C(*locked_hashmap);
+	pthread_mutex_destroy(&(hashmap->mutex));
+	for (unsigned short int entry = 0; entry < HASHMAP_N_ENTRIES; ++entry) {
+		while (hashmap->entries[entry] != NULL) {
+			locked_hashmap_remove(&(hashmap->entries[entry]), hashmap->entry_deletion_processor);
+		}
+	}
+	free(hashmap);
+}
+void hashmap_destroy(struct hashmap *hashmap) {
+	struct locked_hashmap *locked_hashmap = hashmap_lock(hashmap);
+	locked_hashmap_destroy(&(locked_hashmap));
+}
+
 unsigned char locked_hashmap_ref_plus(struct locked_hashmap **locked_hashmap, int b) {
 	unsigned int *rc = &(HASHMAP_LH_C(*locked_hashmap)->ref_count);
 	unsigned long long int chk = *rc + b;
@@ -43,16 +59,6 @@ unsigned char locked_hashmap_ref_plus(struct locked_hashmap **locked_hashmap, in
 	}
 	return 1;
 }
-
-struct locked_hashmap *hashmap_lock(struct hashmap *hashmap) {
-	pthread_mutex_lock(&(hashmap->mutex));
-	return (struct locked_hashmap *)hashmap;
-}
-void locked_hashmap_unlock(struct locked_hashmap **locked_hashmap) {
-	pthread_mutex_unlock(&((HASHMAP_LH_C(*locked_hashmap))->mutex));
-	*locked_hashmap = NULL;
-}
-
 unsigned char hashmap_ref_plus(struct hashmap *hashmap, int b) {
 	struct locked_hashmap *locked_hashmap = hashmap_lock(hashmap);
 	unsigned char r = locked_hashmap_ref_plus(&(locked_hashmap), b);
@@ -62,19 +68,14 @@ unsigned char hashmap_ref_plus(struct hashmap *hashmap, int b) {
 	return r;
 }
 
-void locked_hashmap_destroy(struct locked_hashmap **locked_hashmap) {
-	struct hashmap *hashmap = HASHMAP_LH_C(*locked_hashmap);
-	pthread_mutex_destroy(&(hashmap->mutex));
-	for (unsigned short int entry = 0; entry < HASHMAP_N_ENTRIES; ++entry) {
-		while (hashmap->entries[entry] != NULL) {
-			locked_hashmap_delete(&(hashmap->entries[entry]), hashmap->entry_deletion_processor);
-		}
-	}
-	free(hashmap);
+
+struct locked_hashmap *hashmap_lock(struct hashmap *hashmap) {
+	pthread_mutex_lock(&(hashmap->mutex));
+	return (struct locked_hashmap *)hashmap;
 }
-void hashmap_destroy(struct hashmap *hashmap) {
-	struct locked_hashmap *locked_hashmap = hashmap_lock(hashmap);
-	locked_hashmap_destroy(&(locked_hashmap));
+void locked_hashmap_unlock(struct locked_hashmap **locked_hashmap) {
+	pthread_mutex_unlock(&((HASHMAP_LH_C(*locked_hashmap))->mutex));
+	*locked_hashmap = NULL;
 }
 
 struct hashmap_entry **locked_hashmap_find(struct hashmap_entry **entry, char *key, size_t key_length) {
@@ -100,7 +101,7 @@ unsigned char locked_hashmap_set_wl(struct locked_hashmap *locked_hashmap, char 
 	if (!fast) {
 		struct hashmap_entry **entry = locked_hashmap_find(entries, key, key_length);
 		if (entry != NULL) {
-			locked_hashmap_delete(entry, HASHMAP_LH_C(locked_hashmap)->entry_deletion_processor);
+			locked_hashmap_remove(entry, HASHMAP_LH_C(locked_hashmap)->entry_deletion_processor);
 		}
 	}
 	new_entry->key = key;
@@ -110,14 +111,14 @@ unsigned char locked_hashmap_set_wl(struct locked_hashmap *locked_hashmap, char 
 	*entries = new_entry;
 	return 1;
 }
+unsigned char locked_hashmap_set(struct locked_hashmap *hashmap, char *key, void *value, unsigned char fast) {
+	return locked_hashmap_set_wl(hashmap, key, strlen(key), value, fast);
+}
 unsigned char hashmap_set_wl(struct hashmap *hashmap, char *key, size_t key_length, void *value, unsigned char fast) {
 	struct locked_hashmap *locked_hashmap = hashmap_lock(hashmap);
 	unsigned char r = locked_hashmap_set_wl(locked_hashmap, key, key_length, value, fast);
 	locked_hashmap_unlock(&(locked_hashmap));
 	return r;
-}
-unsigned char locked_hashmap_set(struct locked_hashmap *hashmap, char *key, void *value, unsigned char fast) {
-	return locked_hashmap_set_wl(hashmap, key, strlen(key), value, fast);
 }
 unsigned char hashmap_set(struct hashmap *hashmap, char *key, void *value, unsigned char fast) {
 	return hashmap_set_wl(hashmap, key, strlen(key), value, fast);
@@ -130,20 +131,20 @@ void *locked_hashmap_get_wl(struct locked_hashmap *hashmap, char *key, size_t ke
 	}
 	return (*value)->value;
 }
+void *locked_hashmap_get(struct locked_hashmap *hashmap, char *key) {
+	return locked_hashmap_get_wl(hashmap, key, strlen(key));
+}
 void *hashmap_get_wl(struct hashmap *hashmap, char *key, size_t key_length) {
 	struct locked_hashmap *locked_hashmap = hashmap_lock(hashmap);
 	void *value = locked_hashmap_get_wl(locked_hashmap, key, key_length);
 	locked_hashmap_unlock(&(locked_hashmap));
 	return value;
 }
-void *locked_hashmap_get(struct locked_hashmap *hashmap, char *key) {
-	return locked_hashmap_get_wl(hashmap, key, strlen(key));
-}
 void *hashmap_get(struct hashmap *hashmap, char *key) {
 	return hashmap_get_wl(hashmap, key, strlen(key));
 }
 
-void locked_hashmap_delete(struct hashmap_entry **entry, void (*processor)(void *)) {
+void locked_hashmap_remove(struct hashmap_entry **entry, void (*processor)(void *)) {
 	struct hashmap_entry *d_entry = *entry;
 	free(d_entry->key);
 	if (processor != NULL) {
@@ -152,13 +153,19 @@ void locked_hashmap_delete(struct hashmap_entry **entry, void (*processor)(void 
 	*entry = d_entry->next;
 	free(d_entry);
 }
-void hashmap_delete_wl(struct hashmap *hashmap, char *key, size_t key_length) {
-	pthread_mutex_lock(&(hashmap->mutex));
-	struct hashmap_entry **entry = locked_hashmap_find(&(hashmap->entries[hashmap_hash(key, key_length) % HASHMAP_N_ENTRIES]), key, key_length);
+void locked_hashmap_delete_wl(struct locked_hashmap *locked_hashmap, char *key, size_t key_length) {
+	struct hashmap_entry **entry = locked_hashmap_find(&(HASHMAP_LH_C(locked_hashmap)->entries[hashmap_hash(key, key_length) % HASHMAP_N_ENTRIES]), key, key_length);
 	if (entry != NULL) {
-		locked_hashmap_delete(entry, hashmap->entry_deletion_processor);
+		locked_hashmap_remove(entry, HASHMAP_LH_C(locked_hashmap)->entry_deletion_processor);
 	}
-	pthread_mutex_unlock(&(hashmap->mutex));
+}
+void locked_hashmap_delete(struct locked_hashmap *locked_hashmap, char *key) {
+	locked_hashmap_delete_wl(locked_hashmap, key, strlen(key));
+}
+void hashmap_delete_wl(struct hashmap *hashmap, char *key, size_t key_length) {
+	struct locked_hashmap *locked_hashmap = hashmap_lock(hashmap);
+	locked_hashmap_delete_wl(locked_hashmap, key, key_length);
+	locked_hashmap_unlock(&(locked_hashmap));
 }
 void hashmap_delete(struct hashmap *hashmap, char *key) {
 	hashmap_delete_wl(hashmap, key, strlen(key));
