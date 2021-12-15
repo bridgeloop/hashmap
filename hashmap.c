@@ -49,7 +49,7 @@ void hashmap_destroy(struct hashmap *hashmap) {
 
 unsigned char locked_hashmap_ref_plus(struct locked_hashmap **locked_hashmap, int b) {
 	unsigned int *rc = &(HASHMAP_LH_C(*locked_hashmap)->ref_count);
-	unsigned long long int chk = *rc + b;
+	unsigned long long int chk = (unsigned long long int)(*rc) + (unsigned long long int)(b);
 	if (chk > (unsigned int)(~0)) {
 		return 0;
 	}
