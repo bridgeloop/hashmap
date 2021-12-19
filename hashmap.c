@@ -25,6 +25,9 @@ struct hashmap *hashmap_create(void (*entry_deletion_processor)(void *value)) {
  	}
 	hashmap->entry_deletion_processor = entry_deletion_processor;
 	hashmap->ref_count = 1;
+	for (unsigned long long idx = 0; idx < HASHMAP_N_ENTRIES; ++idx) {
+		hashmap->entries[idx] = NULL;
+	}
 	if (pthread_mutex_init(&(hashmap->mutex), NULL) != 0) {
 		free(hashmap);
 		return NULL;
