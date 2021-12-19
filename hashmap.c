@@ -68,7 +68,6 @@ unsigned char hashmap_ref_plus(struct hashmap *hashmap, int b) {
 	return r;
 }
 
-
 struct locked_hashmap *hashmap_lock(struct hashmap *hashmap) {
 	pthread_mutex_lock(&(hashmap->mutex));
 	return (struct locked_hashmap *)hashmap;
