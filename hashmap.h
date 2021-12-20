@@ -2,7 +2,7 @@
 #define HASHMAP_H
 
 #ifndef HASHMAP_N_ENTRIES
-#define HASHMAP_N_ENTRIES 6151
+#define HASHMAP_N_ENTRIES 193
 #endif
 
 #include <pthread.h>
