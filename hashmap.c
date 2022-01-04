@@ -82,7 +82,7 @@ void locked_hashmap_unlock(struct locked_hashmap **locked_hashmap) {
 
 struct hashmap_entry **locked_hashmap_find(struct hashmap_entry **entry, char *key, size_t key_length) {
 	for (; *entry != NULL; entry = &((*entry)->next)) {
-		if (key_length == (*entry)->key_length && strncmp(key, (*entry)->key, key_length) == 0) {
+		if (key_length == (*entry)->key_length && memcmp(key, (*entry)->key, key_length) == 0) {
 			return entry;
 		}
 	}
