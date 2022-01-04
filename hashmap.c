@@ -5,6 +5,15 @@
 
 #define HASHMAP_LH_C(x) ((struct hashmap *)x)
 
+static void *hashmap_memdup(void *src, size_t len) {
+	void *dest = malloc(len);
+	if (dest == NULL) {
+		return NULL;
+	}
+	memcpy(dest, src, len);
+	return dest;
+}
+
 unsigned int hashmap_hash(char *key, size_t key_length) {
 	unsigned int hash = 0;
 	while (key_length--) {
@@ -90,7 +99,7 @@ struct hashmap_entry **locked_hashmap_find(struct hashmap_entry **entry, char *k
 }
 
 unsigned char locked_hashmap_set_wl(struct locked_hashmap *locked_hashmap, char *key, size_t key_length, void *value, unsigned char fast) {
-	key = strndup(key, key_length);
+	key = hashmap_memdup(key, key_length);
 	if (key == NULL) {
 		return 0;
 	}
