@@ -1,7 +1,8 @@
 #include "hashmap.h"
+
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 
 #define HASHMAP_LH_C(x) ((struct hashmap *)x)
 
@@ -29,9 +30,9 @@ unsigned int hashmap_hash(char *key, size_t key_length) {
 
 struct hashmap *hashmap_create(void (*entry_deletion_processor)(void *value)) {
 	struct hashmap *hashmap = malloc(sizeof(struct hashmap));
- 	if (hashmap == NULL) {
- 	 	return NULL;
- 	}
+	if (hashmap == NULL) {
+		return NULL;
+	}
 	hashmap->entry_deletion_processor = entry_deletion_processor;
 	hashmap->ref_count = 1;
 	for (unsigned long long int idx = 0; idx < HASHMAP_N_ENTRIES; ++idx) {
