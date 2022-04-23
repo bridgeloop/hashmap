@@ -20,7 +20,7 @@ struct hashmap {
 	void (*entry_deletion_processor)(void *value);
 	unsigned int ref_count;
 };
-struct locked_hashmap {}; // for the type itself
+struct locked_hashmap; // for the type itself
 
 unsigned int hashmap_hash(char *key, size_t key_length);
 
