@@ -322,7 +322,7 @@ int main(void) {
 		return 1;
 	}
 	hashmap_key_release(hashmap, &(key), false);
-	hashmap_destroy(hashmap);
+	hashmap_destroy_ref(&(hashmap));
 	return 0;
 }
 #endif
