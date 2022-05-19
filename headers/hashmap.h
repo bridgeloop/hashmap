@@ -2,6 +2,8 @@
 #define HASHMAP_H
 
 #include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 struct hashmap_bucket {
 	struct hashmap_entry *entries;

@@ -27,7 +27,7 @@ void hashmap_entry_destroy(
 	struct hashmap_entry *entry = *next;
 	*next = entry->next;
 	if (hashmap->drop_handler != NULL) {
-		hashmap->drop_handler(next, drop_mode);
+		hashmap->drop_handler(entry->value, drop_mode);
 	}
 	free(entry);
 	if (bucket->entries == NULL) {
@@ -157,15 +157,29 @@ struct hashmap *hashmap_create(
 	return NULL;
 }
 
+pthread_mutex_t *hashmap_division_mutex_for_bucket(
+	struct hashmap *hashmap,
+	size_t bucket_id
+) {
+	size_t n_divisions = hashmap->n_divisions;
+	size_t buckets_per_division = hashmap->n_buckets / n_divisions;
+	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
+	pthread_mutex_t *mutexes = (pthread_mutex_t *)&(buckets[hashmap->n_buckets]);
+	size_t division = bucket_id / buckets_per_division;
+	if (division == n_divisions) {
+		// n_divisions != 0;
+		division -= 1;
+	}
+	return &(mutexes[division]);
+}
+
 pthread_mutex_t *hashmap_key_locked_mutex(struct hashmap *hashmap, struct hashmap_key *key) {
 	if (key->bucket == NULL) {
 		return NULL;
 	}
 	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
-	pthread_mutex_t *mutexes = (pthread_mutex_t *)&(buckets[hashmap->n_buckets]);
 	size_t locked_bucket_id = ((unsigned char *)key->bucket - hashmap->buf) / sizeof(struct hashmap_bucket);
-	pthread_mutex_t *locked_division_mutex = &(mutexes[locked_bucket_id / hashmap->n_divisions]);
-	return locked_division_mutex;
+	return hashmap_division_mutex_for_bucket(hashmap, locked_bucket_id);
 }
 
 void hashmap_key_initialise(struct hashmap_key *key) {
@@ -196,10 +210,9 @@ void hashmap_key_obtain(
 	size_t key_sz
 ) {
 	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
-	pthread_mutex_t *mutexes = (pthread_mutex_t *)&(buckets[hashmap->n_buckets]);
 	size_t bucket_id = hashmap_hash(key, key_sz) % hashmap->n_buckets;
 
-	pthread_mutex_t *division_mutex = &(mutexes[bucket_id / hashmap->n_divisions]);
+	pthread_mutex_t *division_mutex = hashmap_division_mutex_for_bucket(hashmap, bucket_id);
 	pthread_mutex_t *locked_mutex = hashmap_key_locked_mutex(hashmap, hmap_key);
 
 	if (locked_mutex != NULL && division_mutex != locked_mutex) {
