@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "../headers/hashmap.h"
 
@@ -67,11 +68,10 @@ void hashmap_destroy(struct hashmap *hashmap) {
 struct hashmap *hashmap_copy_ref(struct hashmap *hashmap) {
 	pthread_mutex_t *mutex = &(hashmap->meta_mutex);
 	pthread_mutex_lock(mutex);
-	size_t ref_count = hashmap->ref_count;
-	hashmap->ref_count += 1;
-	if (ref_count > hashmap->ref_count) {
-		hashmap->ref_count -= 1;
+	if (hashmap->ref_count == SIZE_MAX) {
 		hashmap = NULL;
+	} else {
+		hashmap->ref_count += 1;
 	}
 	pthread_mutex_unlock(mutex);
 	return hashmap;
