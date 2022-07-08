@@ -194,7 +194,7 @@ void hashmap_key_release(struct hashmap *hashmap, struct hashmap_key *key, bool 
 	}
 	// invalidate key
 	key->key = NULL;
-	key->key_sz =  1 /* arbitrary non-zero value */;
+	key->key_sz = 1 /* arbitrary non-zero value */;
 	if (!hold_lock) {
 		pthread_mutex_unlock(
 			hashmap_key_locked_mutex(hashmap, key)
