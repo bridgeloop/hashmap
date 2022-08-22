@@ -30,7 +30,9 @@ static void hashmap_entry_destroy(
 	struct hashmap *hashmap,
 	struct hashmap_bucket *bucket,
 	struct hashmap_entry **next,
-	enum hashmap_drop_mode drop_mode
+	enum hashmap_drop_mode drop_mode,
+
+	bool lock
 ) {
 	struct hashmap_entry *entry = *next;
 	*next = entry->next;
@@ -39,7 +41,9 @@ static void hashmap_entry_destroy(
 	}
 	free(entry);
 	if (bucket->entries == NULL) {
-		ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
+		if (lock) {
+			ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
+		}
 		struct hashmap_bucket *next_bucket = bucket->next;
 		(*bucket->prev_next) = next_bucket;
 		if (next_bucket != NULL) {
@@ -47,30 +51,38 @@ static void hashmap_entry_destroy(
 		}
 		bucket->next = NULL;
 		bucket->prev_next = NULL;
-		ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
+		if (lock) {
+			ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
+		}
 	}
 	return;
 }
 
-static void hashmap_destroy(struct hashmap *hashmap) {
+static inline pthread_mutex_t *hashmap_mutexes(struct hashmap *hashmap) {
 	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
 	pthread_mutex_t *mutexes = (pthread_mutex_t *)&(buckets[hashmap->n_buckets]);
+	return mutexes;
+}
+
+static void hashmap_destroy(struct hashmap *hashmap) {
+	pthread_mutex_t *mutexes = hashmap_mutexes(hashmap);
 	for (size_t idx = 0; idx < hashmap->n_divisions; ++idx) {
 		if (pthread_mutex_destroy(&(mutexes[idx])) != 0) {
-			fputs("programming error: tried to destroy a hashmap while holding one of its keys\n", stderr);
+			fputs("programming error: tried to delete a hashmap's entries while holding one of its keys\n", stderr);
 			abort();
 		}
 	}
+	ENSURE(pthread_mutex_destroy(&(hashmap->meta_mutex)));
 	struct hashmap_bucket **bucket_with_entries = &(hashmap->bucket_with_entries);
 	while ((*bucket_with_entries) != NULL) {
 		hashmap_entry_destroy(
 			hashmap,
 			(*bucket_with_entries),
 			&((*bucket_with_entries)->entries),
-			hashmap_drop_delete
+			hashmap_drop_delete,
+			false
 		);
 	}
-	ENSURE(pthread_mutex_destroy(&(hashmap->meta_mutex)));
 	free(hashmap);
 	return;
 }
@@ -181,8 +193,7 @@ static pthread_mutex_t *hashmap_division_mutex_for_bucket(
 ) {
 	size_t n_divisions = hashmap->n_divisions;
 	size_t buckets_per_division = hashmap->n_buckets / n_divisions;
-	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
-	pthread_mutex_t *mutexes = (pthread_mutex_t *)&(buckets[hashmap->n_buckets]);
+	pthread_mutex_t *mutexes = hashmap_mutexes(hashmap);
 	size_t division = bucket_id / buckets_per_division;
 	if (division == n_divisions) {
 		assert(n_divisions != 0);
@@ -350,7 +361,8 @@ bool hashmap_delete(struct hashmap *hashmap, struct hashmap_key *key) {
 		hashmap,
 		key->bucket,
 		next,
-		hashmap_drop_delete
+		hashmap_drop_delete,
+		true
 	);
 	return true;
 }
@@ -370,6 +382,33 @@ void hashmap_static_key_release(void *static_hashmap, struct hashmap_key *key, b
 	struct hashmap *hashmap = static_hashmap;
 	assert(hashmap->ref_count == SIZE_MAX);
 	return hashmap_key_release(hashmap, key, hold_lock);
+}
+
+void hashmap_static_delete_entries(void *static_hashmap) {
+	struct hashmap *hashmap = static_hashmap;
+	assert(hashmap->ref_count == SIZE_MAX);
+
+	pthread_mutex_t *mutexes = hashmap_mutexes(hashmap);
+
+	for (size_t idx = 0; idx < hashmap->n_divisions; ++idx) {
+		ENSURE(pthread_mutex_lock(&(mutexes[idx])));
+	}
+	ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
+	struct hashmap_bucket **bucket_with_entries = &(hashmap->bucket_with_entries);
+	while ((*bucket_with_entries) != NULL) {
+		hashmap_entry_destroy(
+			hashmap,
+			(*bucket_with_entries),
+			&((*bucket_with_entries)->entries),
+			hashmap_drop_delete,
+			false
+		);
+	}
+	ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
+	for (size_t idx = 0; idx < hashmap->n_divisions; ++idx) {
+		ENSURE(pthread_mutex_unlock(&(mutexes[idx])));
+	}
+	return;
 }
 
 bool hashmap_static_get(void *static_hashmap, struct hashmap_key *key, void **value) {
@@ -415,6 +454,7 @@ int main(void) {
 		return 1;
 	}
 	hashmap_static_key_release(&(test), &(key), false);
+	hashmap_static_delete_entries(&(test));
 	#endif
 
 	return 0;

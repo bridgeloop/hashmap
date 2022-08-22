@@ -78,6 +78,8 @@ void hashmap_static_key_obtain(
 );
 void hashmap_static_key_release(void *static_hashmap, struct hashmap_key *key, bool hold_lock);
 
+void hashmap_static_delete_entries(void *static_hashmap);
+
 bool hashmap_static_get(void *static_hashmap, struct hashmap_key *key, void **value);
 bool hashmap_static_set(void *static_hashmap, struct hashmap_key *key, void *value);
 bool hashmap_static_delete(void *static_hashmap, struct hashmap_key *key);
