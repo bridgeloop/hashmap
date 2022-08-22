@@ -11,19 +11,13 @@
 
 #include "../headers/hashmap.h"
 
+#define XXH_INLINE_ALL
+#include "headers/xxhash.h"
+
 #define ENSURE(expr) if (expr != 0) { abort(); };
 
-static unsigned int hashmap_hash(const unsigned char *key, size_t key_sz) {
-	unsigned int hash = 0;
-	while (key_sz--) {
-		hash += *(key++);
-		hash += hash << 10;
-		hash ^= hash >> 6;
-	}
-	hash += hash << 3;
-	hash ^= hash >> 11;
-	hash += hash << 15;
-	return hash;
+static inline size_t hashmap_hash(const unsigned char *key, size_t key_sz) {
+	return XXH3_64bits(key, key_sz);
 }
 
 static void hashmap_entry_destroy(
