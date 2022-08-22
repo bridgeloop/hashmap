@@ -390,7 +390,6 @@ bool hashmap_static_delete(void *static_hashmap, struct hashmap_key *key) {
 #endif
 
 #ifdef HASHMAP_MAIN
-#include <stdio.h>
 int main(void) {
 	void *ptr = "hi";
 	void *val;
