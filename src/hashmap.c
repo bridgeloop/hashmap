@@ -23,18 +23,20 @@ static inline size_t hashmap_hash(const unsigned char *key, size_t key_sz) {
 static void hashmap_entry_destroy(
 	struct hashmap *hashmap,
 	struct hashmap_bucket *bucket,
-	struct hashmap_entry **next,
+	struct hashmap_entry *entry,
 	enum hashmap_drop_mode drop_mode,
 
 	bool lock
 ) {
-	struct hashmap_entry *entry = *next;
-	*next = entry->next;
 	if (hashmap->drop_handler != NULL) {
-		hashmap->drop_handler(entry->value, drop_mode);
+		hashmap->drop_handler(entry->inner->value, drop_mode);
 	}
-	free(entry);
-	if (bucket->entries == NULL) {
+	free(entry->inner);
+	bucket->n_entries -= 1;
+	if (bucket->n_entries == 0) {
+		free(bucket->entries);
+		bucket->entries = NULL;
+
 		if (lock) {
 			ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
 		}
@@ -47,6 +49,20 @@ static void hashmap_entry_destroy(
 		bucket->prev_next = NULL;
 		if (lock) {
 			ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
+		}
+	} else {
+		struct hashmap_entry *entries = malloc(sizeof(struct hashmap_entry) * bucket->n_entries);
+		if (entries == NULL) {
+			struct hashmap_entry *last_entry = &(bucket->entries[bucket->n_entries]);
+			memmove(entry, entry + 1, sizeof(struct hashmap_entry) * (last_entry - entry));
+		} else {
+			for (size_t idx = 0, idx2 = 0; idx <= bucket->n_entries; ++idx) {
+				if (&(bucket->entries[idx]) != entry) {
+					entries[idx2++] = bucket->entries[idx];
+				}
+			}
+			free(bucket->entries);
+			bucket->entries = entries;
 		}
 	}
 	return;
@@ -72,7 +88,7 @@ static void hashmap_destroy(struct hashmap *hashmap) {
 		hashmap_entry_destroy(
 			hashmap,
 			(*bucket_with_entries),
-			&((*bucket_with_entries)->entries),
+			(*bucket_with_entries)->entries,
 			hashmap_drop_delete,
 			false
 		);
@@ -232,7 +248,8 @@ void hashmap_key_obtain(
 	size_t key_sz
 ) {
 	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
-	size_t bucket_id = hashmap_hash(key, key_sz) % hashmap->n_buckets;
+	size_t hash = hashmap_hash(key, key_sz);
+	size_t bucket_id = hash % hashmap->n_buckets;
 
 	pthread_mutex_t *division_mutex = hashmap_division_mutex_for_bucket(hashmap, bucket_id);
 	pthread_mutex_t *locked_mutex = hashmap_key_locked_mutex(hashmap, hmap_key);
@@ -245,6 +262,7 @@ void hashmap_key_obtain(
 	}
 	hmap_key->key = key;
 	hmap_key->key_sz = key_sz;
+	hmap_key->hash = hash;
 	hmap_key->bucket = &(buckets[bucket_id]);
 	return;
 }
@@ -264,18 +282,98 @@ void hashmap_key_release(struct hashmap *hashmap, struct hashmap_key *key, bool 
 	return;
 }
 
-static struct hashmap_entry **hashmap_entry_find(struct hashmap_key *key) {
-	struct hashmap_entry **next = &(key->bucket->entries);
-	while ((*next) != NULL) {
-		if (
-			(*next)->key_sz == key->key_sz &&
-			memcmp((*next)->key, key->key, key->key_sz) == 0
-		) {
-			return next;
+static bool hashmap_entry_find(struct hashmap_key *key, struct hashmap_entry **out_entry) {
+	/*
+	 * shits are (unstable) sorted by hash, and then by key_sz
+	 * e.g.
+	 * +---------+---------+---------+
+	 * |hash:0   |hash:0   |hash:1   |
+	 * |key_sz:12|key_sz:16|key_sz:11|
+	 * |inner:...|inner:...|inner:...|
+	 * +---------+---------+---------+
+	 */
+	size_t hash = key->hash;
+	size_t key_sz = key->key_sz;
+
+	// find stage 1: binary search for hash
+	struct hashmap_entry *entries = key->bucket->entries;
+	struct hashmap_entry *entries_subset = entries;
+	size_t n_entries = key->bucket->n_entries;
+	struct hashmap_entry *after_entries = &(entries[n_entries]);
+	// do not call this function if there are no entries in the bucket
+	assert(entries != NULL);
+	size_t len = n_entries;
+	assert(len != 0);
+	struct hashmap_entry *entry;
+	for (;;) {
+		size_t idx = len / 2;
+		size_t entry_hash = entries_subset[idx].hash;
+		if (hash < entry_hash) {
+			len /= 2;
+		} else {
+			if (hash == entry_hash) {
+				entry = &(entries_subset[idx]);
+				break;
+			}
+			entries_subset = &(entries_subset[idx + 1]);
+			len = (len - 1) / 2;
 		}
-		next = &((*next)->next);
+		if (len == 0) {
+			*out_entry = entries_subset;
+			return false;
+		}
 	}
-	return NULL;
+
+	// find stage 2: look for matching keys
+	#define entry_key_sz(entry) entry->key_sz
+	#define entry_memcmp(entry) if (memcmp(entry->inner->key, key->key, key_sz) == 0) { \
+		*out_entry = entry; \
+		return true; \
+	}
+	if (key_sz == entry_key_sz(entry)) {
+		entry_memcmp(entry);
+		for (struct hashmap_entry *curr = entry + 1; curr < after_entries && key_sz == entry_key_sz(curr); ++entry) {
+			entry_memcmp(curr);
+		}
+		if (entry != entries) for (struct hashmap_entry *curr = entry - 1; key_sz == entry_key_sz(curr); --entry) {
+			entry_memcmp(curr);
+			if (curr == entries) {
+				break;
+			}
+		}
+		*out_entry = entry;
+		return false;
+	}
+
+	int step;
+	struct hashmap_entry *sentinel, *fail_val;
+	if (key_sz < entry_key_sz(entry)) {
+		step = -1;
+		sentinel = entries;
+		fail_val = entries;
+	} else {
+		step = 1;
+		sentinel = after_entries - 1;
+		fail_val = after_entries;
+	}
+
+	#define check_sentinel() if (entry == sentinel) { \
+		*out_entry = fail_val; \
+		return false; \
+	}
+	check_sentinel();
+	entry -= 1;
+	while (entry_key_sz(entry) != key_sz) {
+		check_sentinel();
+		entry += step;
+	}
+	do {
+		entry_memcmp(entry);
+		check_sentinel();
+		entry -= 1;
+	} while (entry_key_sz(entry) == key_sz);
+	*out_entry = entry + 1;
+	return false;
 }
 
 bool hashmap_get(struct hashmap *hashmap, struct hashmap_key *key, void **value) {
@@ -286,12 +384,28 @@ bool hashmap_get(struct hashmap *hashmap, struct hashmap_key *key, void **value)
 		return false;
 	}
 	validate_bucket(hashmap, key->bucket);
-	struct hashmap_entry **next = hashmap_entry_find(key);
-	if (next == NULL) {
+	if (key->bucket->entries == NULL) {
 		return false;
 	}
-	*value = (*next)->value;
+	struct hashmap_entry *entry;
+	if (!hashmap_entry_find(key, &(entry))) {
+		return false;
+	}
+	*value = entry->inner->value;
 	return true;
+}
+
+static inline struct hashmap_entry_inner *hashmap_alloc_entry_inner(struct hashmap_key *key, void *value) {
+	struct hashmap_entry_inner *inner = malloc(
+		sizeof(struct hashmap_entry_inner) +
+		key->key_sz
+	);
+	if (inner == NULL) {
+		return NULL;
+	}
+	memcpy(inner->key, key->key, key->key_sz);
+	inner->value = value;
+	return inner;
 }
 bool hashmap_set(struct hashmap *hashmap, struct hashmap_key *key, void *value) {
 	if (
@@ -301,42 +415,60 @@ bool hashmap_set(struct hashmap *hashmap, struct hashmap_key *key, void *value) 
 		return false;
 	}
 	validate_bucket(hashmap, key->bucket);
-	struct hashmap_entry *entry = NULL;
-	struct hashmap_entry **next = hashmap_entry_find(key);
-	if (next != NULL) {
-		entry = *next;
-	}
 	struct hashmap_bucket *bucket = key->bucket;
-	if (entry == NULL) {
-		size_t key_sz = key->key_sz;
-		entry = malloc(
-			sizeof(struct hashmap_entry) +
-			key_sz
-		);
-		if (entry == NULL) {
+
+	if (bucket->entries == NULL) {
+		struct hashmap_entry *entry = malloc(sizeof(struct hashmap_entry));
+		struct hashmap_entry_inner *inner = hashmap_alloc_entry_inner(key, value);
+		if (entry == NULL || inner == NULL) {
+			if (entry != NULL) {
+				free(entry);
+			}
+			if (inner != NULL) {
+				free(inner);
+			}
 			return false;
 		}
-		memcpy(entry->key, key->key, key_sz);
-		entry->key_sz = key_sz;
-		if (bucket->entries == NULL) {
-			ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
-			struct hashmap_bucket **bucket_with_entries = &(hashmap->bucket_with_entries);
-			bucket->prev_next = bucket_with_entries;
-			if (bucket->next != NULL) {
-				bucket->next->prev_next = &(bucket->next);
-			}
-			bucket->next = (*bucket_with_entries);
-			(*bucket_with_entries) = bucket;
-			ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
-		}
-		entry->next = bucket->entries;
+		entry->key_sz = key->key_sz;
+		entry->hash = key->hash;
+		entry->inner = inner;
 		bucket->entries = entry;
-	} else {
-		if (hashmap->drop_handler != NULL && entry->value != value) {
-			hashmap->drop_handler(entry->value, hashmap_drop_set);
-		}
+		bucket->n_entries = 1;
+		return true;
 	}
-	entry->value = value;
+
+	struct hashmap_entry *entry;
+	if (hashmap_entry_find(key, &(entry))) {
+		if (hashmap->drop_handler != NULL) {
+			hashmap->drop_handler(entry->inner->value, hashmap_drop_set);
+		}
+		entry->inner->value = value;
+		return true;
+	}
+
+	struct hashmap_entry *entries = malloc(sizeof(struct hashmap_entry) * (bucket->n_entries + 1));
+	struct hashmap_entry_inner *inner = hashmap_alloc_entry_inner(key, value);
+	if (entries == NULL || inner == NULL) {
+		if (entries != NULL) {
+			free(entries);
+		}
+		if (inner != NULL) {
+			free(inner);
+		}
+		return false;
+	}
+
+	size_t n_entries_left = entry - bucket->entries;
+	size_t n_entries_right = &(bucket->entries[bucket->n_entries]) - entry;
+	memcpy(entries, bucket->entries, sizeof(struct hashmap_entry) * (entry - bucket->entries));
+	entries[n_entries_left].key_sz = key->key_sz;
+	entries[n_entries_left].hash = key->hash;
+	entries[n_entries_left].inner = inner;
+	memcpy(&(entries[n_entries_left + 1]), entry, sizeof(struct hashmap_entry) * n_entries_right);
+
+	free(bucket->entries);
+	bucket->entries = entries;
+	bucket->n_entries += 1;
 	return true;
 }
 bool hashmap_delete(struct hashmap *hashmap, struct hashmap_key *key) {
@@ -347,14 +479,17 @@ bool hashmap_delete(struct hashmap *hashmap, struct hashmap_key *key) {
 		return false;
 	}
 	validate_bucket(hashmap, key->bucket);
-	struct hashmap_entry **next = hashmap_entry_find(key);
-	if (next == NULL) {
+	if (key->bucket->entries == NULL) {
+		return false;
+	}
+	struct hashmap_entry *entry;
+	if (!hashmap_entry_find(key, &(entry))) {
 		return false;
 	}
 	hashmap_entry_destroy(
 		hashmap,
 		key->bucket,
-		next,
+		entry,
 		hashmap_drop_delete,
 		true
 	);
@@ -393,7 +528,7 @@ void hashmap_static_delete_entries(void *static_hashmap) {
 		hashmap_entry_destroy(
 			hashmap,
 			(*bucket_with_entries),
-			&((*bucket_with_entries)->entries),
+			(*bucket_with_entries)->entries,
 			hashmap_drop_delete,
 			false
 		);
@@ -423,33 +558,34 @@ bool hashmap_static_delete(void *static_hashmap, struct hashmap_key *key) {
 #endif
 
 #ifdef HASHMAP_MAIN
+#include <time.h>
 int main(void) {
-	void *ptr = "hi";
-	void *val;
-
 	struct hashmap *hashmap = hashmap_create(183, 1, NULL);
 	struct hashmap_key key = HASHMAP_KEY_INITIALIZER;
-	hashmap_key_obtain(hashmap, &(key), "x", 1);
-	hashmap_set(hashmap, &(key), ptr);
-	hashmap_get(hashmap, &(key), &(val));
-	if (val != ptr) {
-		return 1;
+	puts("test: hashmap_set");
+	clock_t time = clock();
+	for (size_t it = 0; it < 0x50000; ++it) {
+		hashmap_key_obtain(hashmap, &(key), (void *)&(it), sizeof(size_t));
+		if (!hashmap_set(hashmap, &(key), (void *)it)) {
+			printf("hashmap_set failed on iter %zu!\n", it);
+			return 1;
+		}
 	}
+	printf("test success in %lf\n", (double)(clock() - time) / (double)CLOCKS_PER_SEC);
+	puts("test: hashmap_get");
+	time = clock();
+	for (size_t it = 0; it < 0x50000; ++it) {
+		hashmap_key_obtain(hashmap, &(key), (void *)&(it), sizeof(size_t));
+		void *val;
+		bool success = hashmap_get(hashmap, &(key), &(val));
+		if (!success || val != (void *)it) {
+			printf("hashmap_get failed on iter %zu!\n", it);
+			return 1;
+		}
+	}
+	printf("test success in %lf\n", (double)(clock() - time) / (double)CLOCKS_PER_SEC);
 	hashmap_key_release(hashmap, &(key), false);
 	hashmap_destroy_ref(&(hashmap));
-
-	#ifdef HASHMAP_STATIC_ENABLED
-	typedef hashmap_create_static_type(183, 1) static_hashmap;
-	static static_hashmap test = hashmap_create_static_value(static_hashmap, NULL);
-	hashmap_static_key_obtain(&(test), &(key), "x", 1);
-	hashmap_static_set(&(test), &(key), ptr);
-	hashmap_static_get(&(test), &(key), &(val));
-	if (val != ptr) {
-		return 1;
-	}
-	hashmap_static_key_release(&(test), &(key), false);
-	hashmap_static_delete_entries(&(test));
-	#endif
 
 	return 0;
 }

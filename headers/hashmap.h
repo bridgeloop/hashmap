@@ -8,6 +8,7 @@
 
 struct hashmap_bucket {
 	struct hashmap_entry *entries;
+	size_t n_entries;
 	struct hashmap_bucket **prev_next;
 	struct hashmap_bucket *next;
 };
@@ -15,15 +16,18 @@ struct hashmap_bucket {
 struct hashmap_key {
 	const unsigned char *key;
 	size_t key_sz;
+	size_t hash;
 	struct hashmap_bucket *bucket;
 };
 #define HASHMAP_KEY_INITIALIZER { .bucket = NULL }
 
 struct hashmap_entry {
-	void *value;
-	struct hashmap_entry *next;
-
+	size_t hash;
 	size_t key_sz;
+	struct hashmap_entry_inner *inner;
+};
+struct hashmap_entry_inner {
+	void *value;
 	unsigned char key[];
 };
 
@@ -64,6 +68,7 @@ struct _hashmap_header {
 	}, \
 	.buckets = { [0 ... sizeof(((type *)NULL)->buckets) / sizeof(struct hashmap_bucket) - 1] = { \
 		.entries = NULL, \
+		.n_entries = 0, \
 		.prev_next = NULL, \
 		.next = NULL, \
 	}, }, \
