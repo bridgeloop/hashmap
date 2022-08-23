@@ -434,6 +434,15 @@ bool hashmap_set(struct hashmap *hashmap, struct hashmap_key *key, void *value) 
 		entry->inner = inner;
 		bucket->entries = entry;
 		bucket->n_entries = 1;
+		ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
+		struct hashmap_bucket **bucket_with_entries = &(hashmap->bucket_with_entries);
+		bucket->prev_next = bucket_with_entries;
+		if (bucket->next != NULL) {
+			bucket->next->prev_next = &(bucket->next);
+		}
+		bucket->next = (*bucket_with_entries);
+		(*bucket_with_entries) = bucket;
+		ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
 		return true;
 	}
 
@@ -585,7 +594,10 @@ int main(void) {
 	}
 	printf("test success in %lf\n", (double)(clock() - time) / (double)CLOCKS_PER_SEC);
 	hashmap_key_release(hashmap, &(key), false);
+	puts("test: hashmap_destroy_ref");
+	time = clock();
 	hashmap_destroy_ref(&(hashmap));
+	printf("test success in %lf\n", (double)(clock() - time) / (double)CLOCKS_PER_SEC);
 
 	return 0;
 }
