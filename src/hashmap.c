@@ -83,15 +83,14 @@ static void hashmap_destroy(struct hashmap *hashmap) {
 		}
 	}
 	ENSURE(pthread_mutex_destroy(&(hashmap->meta_mutex)));
-	struct hashmap_bucket **bucket_with_entries = &(hashmap->bucket_with_entries);
-	while ((*bucket_with_entries) != NULL) {
-		hashmap_entry_destroy(
-			hashmap,
-			(*bucket_with_entries),
-			(*bucket_with_entries)->entries,
-			hashmap_drop_delete,
-			false
-		);
+	struct hashmap_bucket *bucket = hashmap->bucket_with_entries;
+	while (bucket != NULL) {
+		struct hashmap_entry *entries = bucket->entries;
+		for (size_t idx = 0; idx < bucket->n_entries; ++idx) {
+			free(entries[idx].inner);
+		}
+		free(entries);
+		bucket = bucket->next;
 	}
 	free(hashmap);
 	return;
@@ -325,17 +324,16 @@ static bool hashmap_entry_find(struct hashmap_key *key, struct hashmap_entry **o
 	}
 
 	// find stage 2: look for matching keys
-	#define entry_key_sz(entry) entry->key_sz
 	#define entry_memcmp(entry) if (memcmp(entry->inner->key, key->key, key_sz) == 0) { \
 		*out_entry = entry; \
 		return true; \
 	}
-	if (key_sz == entry_key_sz(entry)) {
+	if (key_sz == entry->key_sz) {
 		entry_memcmp(entry);
-		for (struct hashmap_entry *curr = entry + 1; curr < after_entries && key_sz == entry_key_sz(curr); ++entry) {
+		for (struct hashmap_entry *curr = entry + 1; curr < after_entries && key_sz == curr->key_sz && hash == curr->hash; ++curr) {
 			entry_memcmp(curr);
 		}
-		if (entry != entries) for (struct hashmap_entry *curr = entry - 1; key_sz == entry_key_sz(curr); --entry) {
+		if (entry != entries) for (struct hashmap_entry *curr = entry - 1; key_sz == curr->key_sz && hash == curr->hash; --curr) {
 			entry_memcmp(curr);
 			if (curr == entries) {
 				break;
@@ -345,35 +343,50 @@ static bool hashmap_entry_find(struct hashmap_key *key, struct hashmap_entry **o
 		return false;
 	}
 
-	int step;
+	#define fail() *out_entry = fail_val; return false
+	#define check_sentinel() if (entry == sentinel) { fail(); }
+
 	struct hashmap_entry *sentinel, *fail_val;
-	if (key_sz < entry_key_sz(entry)) {
-		step = -1;
+	if (key_sz < entry->key_sz) {
 		sentinel = entries;
 		fail_val = entries;
-	} else {
-		step = 1;
-		sentinel = after_entries - 1;
-		fail_val = after_entries;
-	}
-
-	#define check_sentinel() if (entry == sentinel) { \
-		*out_entry = fail_val; \
-		return false; \
-	}
-	check_sentinel();
-	entry -= 1;
-	while (entry_key_sz(entry) != key_sz) {
-		check_sentinel();
-		entry += step;
-	}
-	do {
-		entry_memcmp(entry);
 		check_sentinel();
 		entry -= 1;
-	} while (entry_key_sz(entry) == key_sz);
-	*out_entry = entry + 1;
-	return false;
+		while (entry->hash == hash && entry->key_sz > key_sz) {
+			check_sentinel();
+			entry -= 1;
+		}
+		if (entry->key_sz != key_sz) {
+			fail_val = entry + 1;
+			fail();
+		}
+		fail_val = entry;
+		do {
+			entry_memcmp(entry);
+			check_sentinel();
+			entry -= 1;
+		} while (entry->key_sz == key_sz && entry->hash == hash);
+		fail();
+	} else {
+		sentinel = after_entries - 1;
+		fail_val = after_entries;
+		check_sentinel();
+		entry += 1;
+		while (entry->hash == hash && entry->key_sz < key_sz) {
+			check_sentinel();
+			entry += 1;
+		}
+		fail_val = entry;
+		if (entry->key_sz != key_sz) {
+			fail();
+		}
+		do {
+			entry_memcmp(entry);
+			check_sentinel();
+			entry += 1;
+		} while (entry->key_sz == key_sz && entry->hash == hash);
+		fail();
+	}
 }
 
 bool hashmap_get(struct hashmap *hashmap, struct hashmap_key *key, void **value) {
@@ -469,6 +482,7 @@ bool hashmap_set(struct hashmap *hashmap, struct hashmap_key *key, void *value) 
 
 	size_t n_entries_left = entry - bucket->entries;
 	size_t n_entries_right = &(bucket->entries[bucket->n_entries]) - entry;
+
 	memcpy(entries, bucket->entries, sizeof(struct hashmap_entry) * (entry - bucket->entries));
 	entries[n_entries_left].key_sz = key->key_sz;
 	entries[n_entries_left].hash = key->hash;
