@@ -20,54 +20,6 @@ static inline size_t hashmap_hash(const unsigned char *key, size_t key_sz) {
 	return XXH3_64bits(key, key_sz);
 }
 
-static void hashmap_entry_destroy(
-	struct hashmap *hashmap,
-	struct hashmap_bucket *bucket,
-	struct hashmap_entry *entry,
-	enum hashmap_drop_mode drop_mode,
-
-	bool lock
-) {
-	if (hashmap->drop_handler != NULL) {
-		hashmap->drop_handler(entry->inner->value, drop_mode);
-	}
-	free(entry->inner);
-	bucket->n_entries -= 1;
-	if (bucket->n_entries == 0) {
-		free(bucket->entries);
-		bucket->entries = NULL;
-
-		if (lock) {
-			ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
-		}
-		struct hashmap_bucket *next_bucket = bucket->next;
-		(*bucket->prev_next) = next_bucket;
-		if (next_bucket != NULL) {
-			next_bucket->prev_next = bucket->prev_next;
-		}
-		bucket->next = NULL;
-		bucket->prev_next = NULL;
-		if (lock) {
-			ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
-		}
-	} else {
-		struct hashmap_entry *entries = malloc(sizeof(struct hashmap_entry) * bucket->n_entries);
-		if (entries == NULL) {
-			struct hashmap_entry *last_entry = &(bucket->entries[bucket->n_entries]);
-			memmove(entry, entry + 1, sizeof(struct hashmap_entry) * (last_entry - entry));
-		} else {
-			for (size_t idx = 0, idx2 = 0; idx <= bucket->n_entries; ++idx) {
-				if (&(bucket->entries[idx]) != entry) {
-					entries[idx2++] = bucket->entries[idx];
-				}
-			}
-			free(bucket->entries);
-			bucket->entries = entries;
-		}
-	}
-	return;
-}
-
 static inline pthread_mutex_t *hashmap_mutexes(struct hashmap *hashmap) {
 	struct hashmap_bucket *buckets = (struct hashmap_bucket *)hashmap->buf;
 	pthread_mutex_t *mutexes = (pthread_mutex_t *)&(buckets[hashmap->n_buckets]);
@@ -86,8 +38,15 @@ static void hashmap_destroy(struct hashmap *hashmap) {
 	struct hashmap_bucket *bucket = hashmap->bucket_with_entries;
 	while (bucket != NULL) {
 		struct hashmap_entry *entries = bucket->entries;
-		for (size_t idx = 0; idx < bucket->n_entries; ++idx) {
-			free(entries[idx].inner);
+		if (hashmap->drop_handler != NULL) {
+			for (size_t idx = 0; idx < bucket->n_entries; ++idx) {
+				hashmap->drop_handler(entries[idx].inner->value, hashmap_drop_delete);
+				free(entries[idx].inner);
+			}
+		} else {
+			for (size_t idx = 0; idx < bucket->n_entries; ++idx) {
+				free(entries[idx].inner);
+			}
 		}
 		free(entries);
 		bucket = bucket->next;
@@ -501,21 +460,48 @@ bool hashmap_delete(struct hashmap *hashmap, struct hashmap_key *key) {
 	) {
 		return false;
 	}
-	validate_bucket(hashmap, key->bucket);
-	if (key->bucket->entries == NULL) {
+	struct hashmap_bucket *bucket = key->bucket;
+	validate_bucket(hashmap, bucket);
+	if (bucket->entries == NULL) {
 		return false;
 	}
 	struct hashmap_entry *entry;
 	if (!hashmap_entry_find(key, &(entry))) {
 		return false;
 	}
-	hashmap_entry_destroy(
-		hashmap,
-		key->bucket,
-		entry,
-		hashmap_drop_delete,
-		true
-	);
+	if (hashmap->drop_handler != NULL) {
+		hashmap->drop_handler(entry->inner->value, hashmap_drop_delete);
+	}
+	free(entry->inner);
+	bucket->n_entries -= 1;
+	if (bucket->n_entries == 0) {
+		free(bucket->entries);
+		bucket->entries = NULL;
+
+		ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
+		struct hashmap_bucket *next_bucket = bucket->next;
+		(*bucket->prev_next) = next_bucket;
+		if (next_bucket != NULL) {
+			next_bucket->prev_next = bucket->prev_next;
+		}
+		bucket->next = NULL;
+		bucket->prev_next = NULL;
+		ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
+	} else {
+		struct hashmap_entry *entries = malloc(sizeof(struct hashmap_entry) * bucket->n_entries);
+		if (entries == NULL) {
+			struct hashmap_entry *last_entry = &(bucket->entries[bucket->n_entries]);
+			memmove(entry, entry + 1, sizeof(struct hashmap_entry) * (last_entry - entry));
+		} else {
+			for (size_t idx = 0, idx2 = 0; idx <= bucket->n_entries; ++idx) {
+				if (&(bucket->entries[idx]) != entry) {
+					entries[idx2++] = bucket->entries[idx];
+				}
+			}
+			free(bucket->entries);
+			bucket->entries = entries;
+		}
+	}
 	return true;
 }
 
@@ -546,15 +532,25 @@ void hashmap_static_delete_entries(void *static_hashmap) {
 		ENSURE(pthread_mutex_lock(&(mutexes[idx])));
 	}
 	ENSURE(pthread_mutex_lock(&(hashmap->meta_mutex)));
-	struct hashmap_bucket **bucket_with_entries = &(hashmap->bucket_with_entries);
-	while ((*bucket_with_entries) != NULL) {
-		hashmap_entry_destroy(
-			hashmap,
-			(*bucket_with_entries),
-			(*bucket_with_entries)->entries,
-			hashmap_drop_delete,
-			false
-		);
+	while (hashmap->bucket_with_entries != NULL) {
+		struct hashmap_bucket *bucket = hashmap->bucket_with_entries;
+		hashmap->bucket_with_entries = bucket->next;
+
+		bucket->prev_next = NULL;
+		bucket->next = NULL;
+
+		struct hashmap_entry *entries = bucket->entries;
+		if (hashmap->drop_handler != NULL) {
+			for (size_t idx = 0; idx < bucket->n_entries; ++idx) {
+				hashmap->drop_handler(entries[idx].inner->value, hashmap_drop_delete);
+				free(entries[idx].inner);
+			}
+		} else {
+			for (size_t idx = 0; idx < bucket->n_entries; ++idx) {
+				free(entries[idx].inner);
+			}
+		}
+		free(entries);
 	}
 	ENSURE(pthread_mutex_unlock(&(hashmap->meta_mutex)));
 	for (size_t idx = 0; idx < hashmap->n_divisions; ++idx) {
