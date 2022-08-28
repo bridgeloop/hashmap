@@ -6,9 +6,20 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+enum hashmap_drop_mode {
+	hashmap_drop_set,
+	hashmap_drop_delete,
+};
+
+typedef void (*hashmap_drop_handler)(void *value, enum hashmap_drop_mode drop_mode);
+
+struct hashmap_entries {
+  struct hashmap_entry *nodes;
+  size_t base, n_nodes;
+};
+
 struct hashmap_bucket {
-	struct hashmap_entry *entries;
-	size_t n_entries;
+	struct hashmap_entries entries;
 	struct hashmap_bucket **prev_next;
 	struct hashmap_bucket *next;
 };
@@ -31,13 +42,8 @@ struct hashmap_entry_inner {
 	unsigned char key[];
 };
 
-enum hashmap_drop_mode {
-	hashmap_drop_set,
-	hashmap_drop_delete,
-};
-
 #define __hashmap_header \
-	void (*drop_handler)(void *value, enum hashmap_drop_mode drop_mode); \
+	hashmap_drop_handler drop_handler; \
 	size_t n_divisions; \
 	size_t n_buckets; \
 	\
@@ -67,8 +73,11 @@ struct _hashmap_header {
 		.ref_count = SIZE_MAX, \
 	}, \
 	.buckets = { [0 ... sizeof(((type *)NULL)->buckets) / sizeof(struct hashmap_bucket) - 1] = { \
-		.entries = NULL, \
-		.n_entries = 0, \
+		.entries = { \
+			.nodes = NULL, \
+			.n_nodes = 0, \
+			.base = 0, \
+		}, \
 		.prev_next = NULL, \
 		.next = NULL, \
 	}, }, \
@@ -102,7 +111,7 @@ struct hashmap {
 struct hashmap *hashmap_create(
 	size_t n_entries,
 	size_t n_divisions,
-	void (*drop_handler)(void *value, enum hashmap_drop_mode drop_mode)
+	hashmap_drop_handler drop_handler
 );
 
 struct hashmap *hashmap_copy_ref(struct hashmap *hashmap);
