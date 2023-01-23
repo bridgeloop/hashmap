@@ -1,0 +1,3 @@
+[submodule "src/ifc"]
+	path = src/ifc
+	url = ssh://git@git.tcp.direct:2222/aiden/ifc.git
