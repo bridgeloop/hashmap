@@ -68,15 +68,15 @@ struct hashmap_bucket_protected {
 		this entry in the buckets array via linear probing
 
 
-		in other words:
-		the value of the variable which stores the loop's
-		iteration, when the entry is found via linear probing
+		i.e., assuming that the entry exists in the hashmap:
+		the distance (to the right, wrapping) from the bucket at index
+		(hash % n_buckets), to the desired bucket
 
-		for example, assuming that the entry exists in the
-		hashmap, the return value of the following pseudo-code function:
+		e.g. (still assuming that the entry exists in the hashmap):
+		the return value of the following pseudo-code function:
 		uint32_t psl() {
-			for (uint32_t it = 0;; it = (it + 1) % capacity) {
-				if (desired_entry == entry) {
+			for (uint32_t it = 0;; ++it) {
+				if (desired_entry == &(buckets[((hash % n_buckets) + it) % n_buckets])) {
 					return it;
 				}
 			}
@@ -266,6 +266,7 @@ static void _hashmap_resize(struct hashmap *hashmap, struct hashmap_area *area, 
 		hashmap->init_idx = 0;
 		hashmap->resize_idx = 0;
 
+		// to-do: maybe make this concurrent
 		uint32_t n = new_n_buckets / *(unsigned int *)hashmap->ifc;
 		for (;;) {
 			uint32_t idx = (hashmap->init_idx += n) - n;
@@ -328,6 +329,7 @@ static void _hashmap_resize(struct hashmap *hashmap, struct hashmap_area *area, 
 	// assist with the resize
 	uint32_t n = n_buckets / *(unsigned int *)hashmap->ifc;
 	for (;;) {
+		// to-do: integer overflow
 		uint32_t idx = (hashmap->resize_idx += n) - n;
 		if (idx >= n_buckets) {
 			break;
