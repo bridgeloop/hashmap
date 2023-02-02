@@ -34,7 +34,16 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <string.h>
-#include <immintrin.h>
+
+#if __has_builtin(__builtin_ia32_pause)
+#define hashmap_mpause() __builtin_ia32_pause()
+#elif __has_builtin(__builtin_arm_isb)
+#define hashmap_mpause() __builtin_arm_isb(15)
+#elif __has_builtin(__builtin_arm_yield)
+#define hashmap_mpause() __builtin_arm_yield()
+#else
+#define hashmap_mpause() (void)0
+#endif
 
 #include "ifc/ifc.h"
 
@@ -157,7 +166,7 @@ static bool _hashmap_find(
 
 	struct hashmap_bucket *bucket = &(buckets[bucket_idx]);
 	while (__atomic_test_and_set(&(bucket->lock), __ATOMIC_ACQUIRE)) {
-		_mm_pause();
+		hashmap_mpause();
 	}
 
 	for (size_t it = 0;; ++it) {
@@ -184,7 +193,7 @@ static bool _hashmap_find(
 		}
 
 		while (__atomic_test_and_set(&(next_bucket->lock), __ATOMIC_ACQUIRE)) {
-			_mm_pause();
+			hashmap_mpause();
 		}
 		__atomic_clear(&(bucket->lock), __ATOMIC_RELEASE);
 
@@ -216,7 +225,7 @@ static void _hashmap_cfi(
 			(*current) = array;
 		}
 		while (__atomic_test_and_set(&((*current)->lock), __ATOMIC_ACQUIRE)) {
-			_mm_pause();
+			hashmap_mpause();
 		}
 		__atomic_clear(old_lock, __ATOMIC_RELEASE);
 
@@ -585,7 +594,7 @@ static enum hashmap_cas_result hashmap_cas(
 					next_bucket = buckets;
 				}
 				while (__atomic_test_and_set(&(next_bucket->lock), __ATOMIC_ACQUIRE)) {
-					_mm_pause();
+					hashmap_mpause();
 				}
 				if (next_bucket->protected.kv == NULL || next_bucket->protected.psl == 0) {
 					__atomic_clear(&(bucket->lock), __ATOMIC_RELEASE);
@@ -743,7 +752,7 @@ struct hashmap *hashmap_create(
 		goto err6;
 	}
 
-	hashmap->reference_count = 0;
+	hashmap->reference_count = 1;
 
 	*(hashmap_callback *)&(hashmap->callback) = callback;
 

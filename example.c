@@ -1,9 +1,9 @@
 #define HASHMAP_HASH_FUNCTION(key) (*(uint64_t *)key ^ 9268326398 /* arbitrary integer */)
-#include "hashmap.h"
+#include "src/hashmap.h"
 #include <time.h>
 #include <stdio.h>
 
-#define N_THREADS 16
+#define N_THREADS 8
 #define _N_BUCKETS 24000000
 #define N_BUCKETS (size_t)((_N_BUCKETS / N_THREADS) * N_THREADS)
 
@@ -132,7 +132,7 @@ int main(int argc, char *argv[]) {
 		void *fuck;
 		pthread_join(threads[x], &(fuck));
 	}
-	printf("success! %lfs\n", rc() - time);
+	printf("success! %lfs\ndeleting %zu values...\n", rc() - time, N_BUCKETS);
 
 	for (size_t x = 0; x < N_THREADS; ++x) {
 		pthread_create(&(threads[x]), NULL, (void *)&(deletet), &(gosh[x]));
