@@ -465,16 +465,16 @@ static void hashmap_key(
 	return;
 }
 
-struct hashmap_area *hashmap_area(struct hashmap *hashmap) {
+static struct hashmap_area *hashmap_area(struct hashmap *hashmap) {
 	return ifc_area(hashmap->ifc);
 }
-void hashmap_area_flush(struct hashmap *hashmap, struct hashmap_area *area) {
+static void hashmap_area_flush(struct hashmap *hashmap, struct hashmap_area *area) {
 	// does not require a lock
 	hashmap->occupied_buckets -= area->reserved;
 	area->reserved = 0;
 	return;
 }
-void hashmap_area_release(struct hashmap *hashmap, struct hashmap_area *area) {
+static void hashmap_area_release(struct hashmap *hashmap, struct hashmap_area *area) {
 	hashmap_area_flush(hashmap, area);
 	ifc_release(hashmap->ifc, area);
 	return;
@@ -681,7 +681,7 @@ static enum hashmap_cas_result hashmap_cas(
 	return hashmap_cas_success;
 }
 
-struct hashmap *hashmap_create(
+static struct hashmap *hashmap_create(
 	uint16_t n_threads,
 	uint32_t initial_size,
 	float resize_percentage,
@@ -781,12 +781,12 @@ struct hashmap *hashmap_create(
 	return hashmap;
 }
 
-struct hashmap *hashmap_copy_ref(struct hashmap *hashmap) {
+static struct hashmap *hashmap_copy_ref(struct hashmap *hashmap) {
 	hashmap->reference_count += 1;
 	return hashmap;
 }
 
-void hashmap_destroy(struct hashmap *hashmap) {
+static void hashmap_destroy(struct hashmap *hashmap) {
 	if (--hashmap->reference_count == 0) {
 		pthread_cond_destroy(&(hashmap->stop_resize_cond));
 		pthread_cond_destroy(&(hashmap->resize_cond));
