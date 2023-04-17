@@ -460,7 +460,7 @@ static void hashmap_key(
 	output_key->key = key;
 	output_key->key_sz = key_sz;
 
-	output_key->hash = HASHMAP_HASH_FUNCTION(key);
+	output_key->hash = HASHMAP_HASH_FUNCTION(key, key_sz);
 
 	return;
 }
