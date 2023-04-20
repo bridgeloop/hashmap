@@ -19,12 +19,10 @@
 #ifndef HASHMAP_H
 #define HASHMAP_H
 
-// this hashmap _can_ be very fast
-// with the right hash function.
-// the only real bottleneck here is
-// malloc, which is used on insert
-// because you cannot enforce
-// lifetimes in c.
+// this hashmap _can_ be very fast with
+// the right hash function. the only real
+// bottleneck here is malloc, which is used on
+// insert because you cannot enforce lifetimes in c.
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -51,6 +49,7 @@
 enum hashmap_callback_reason {
 	hashmap_acquire,
 
+	hashmap_drop_destroy,
 	hashmap_drop_delete,
 	hashmap_drop_set,
 };
@@ -793,8 +792,21 @@ static void hashmap_destroy(struct hashmap *hashmap) {
 		pthread_mutex_destroy(&(hashmap->ensured_mutex));
 		pthread_cond_destroy(&(hashmap->resize_cond));
 		pthread_mutex_destroy(&(hashmap->resize_mutex));
-		free(hashmap->buckets);
+
 		ifc_free(hashmap->ifc);
+
+		for (size_t idx = 0; hashmap->occupied_buckets != 0; ++idx) {
+			struct hashmap_bucket_protected *prot = &(hashmap->buckets[idx].protected);
+			if (prot->kv != NULL) {
+				if (hashmap->callback != NULL) {
+					hashmap->callback(prot->kv->value, hashmap_drop_destroy, NULL);
+				}
+				free(prot->kv);
+				hashmap->occupied_buckets -= 1;
+			}
+		}
+
+		free(hashmap->buckets);
 		free(hashmap);
 	}
 	return;
