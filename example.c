@@ -1,4 +1,4 @@
-#define HASHMAP_HASH_FUNCTION(key) (*(uint64_t *)key ^ 9268326398 /* arbitrary integer */)
+#define HASHMAP_HASH_FUNCTION(key, ksz) (*(uint64_t *)key ^ 9268326398 /* arbitrary integer */)
 #include "src/hashmap.h"
 #include <time.h>
 #include <stdio.h>
