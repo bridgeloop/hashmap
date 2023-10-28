@@ -1,143 +1,179 @@
-#define HASHMAP_HASH_FUNCTION(key, ksz) (*(uint64_t *)key ^ 9268326398 /* arbitrary integer */)
-#include "src/hashmap.h"
-#include <time.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 
-#define N_THREADS 8
-#define _N_BUCKETS 24000000
-#define N_BUCKETS (size_t)((_N_BUCKETS / N_THREADS) * N_THREADS)
-
-struct hashmap *the_hashmap;
-struct gosh {
-	size_t idx;
-	size_t n;
-};
-
-void *go(struct gosh *gosh) {
-	void *x;
-
-	struct hashmap_key key;
-
-	struct hashmap_area *area = hashmap_area(the_hashmap);
-	hashmap_reserve(the_hashmap, area, gosh->n);
-
-	for (size_t it = 0; it < gosh->n; ++it) {
-		size_t idx = gosh->idx + it;
-
-		hashmap_key(&(idx), sizeof(idx), &(key));
-		if (hashmap_cas(
-			the_hashmap, area, &(key),
-			&(x), (void *)idx,
-			hashmap_cas_set, NULL
-		) == hashmap_cas_error) {
-			puts("error!");
-			exit(1);
-		}
-	}
-
-	hashmap_area_release(the_hashmap, area);
-	return NULL;
-}
-
-void *readt(struct gosh *gosh) {
-	void *x;
-
-	struct hashmap_key key;
-
-	struct hashmap_area *area = hashmap_area(the_hashmap);
-
-	for (size_t it = 0; it < gosh->n; ++it) {
-		size_t idx = gosh->idx + it;
-
-		hashmap_key(&(idx), sizeof(idx), &(key));
-		if (hashmap_cas(
-			the_hashmap, area, &(key),
-			&(x), NULL,
-			hashmap_cas_get, NULL
-		) == hashmap_cas_error) {
-			puts("error!");
-			exit(1);
-		}
-	}
-
-	hashmap_area_release(the_hashmap, area);
-	return NULL;
-}
-
-void *deletet(struct gosh *gosh) {
-	void *x;
-
-	struct hashmap_key key;
-
-	struct hashmap_area *area = hashmap_area(the_hashmap);
-
-	for (size_t it = 0; it < gosh->n; ++it) {
-		size_t idx = gosh->idx + it;
-
-		hashmap_key(&(idx), sizeof(idx), &(key));
-		if (hashmap_cas(
-			the_hashmap, area, &(key),
-			&(x), NULL + 1,
-			hashmap_cas_delete, NULL
-		) == hashmap_cas_error) {
-			puts("error!");
-			exit(1);
-		}
-	}
-
-	hashmap_area_release(the_hashmap, area);
-	return NULL;
-}
-
+#include <time.h>
 double rc(void) {
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &(now));
     return now.tv_sec + (now.tv_nsec * 1e-9);
 }
 
+#define HASHMAP_HASH_FUNCTION(key, key_sz) (*(uint64_t *)key ^ 9268326398)
+#include "src/hashmap.h"
+
+#define N_THREADS 8
+#define N_BUCKETS 24000000
+
+struct hashmap *the_hashmap;
+
+void *writet(void *_) {
+	while (nolock) hashmap_mpause();
+
+	static atomic_uint_fast32_t chunk = 0;
+	static const uint_fast32_t CHUNK_SZ = 1024;
+
+	void *x;
+
+	struct hashmap_key key;
+
+	struct hashmap_area *area = hashmap_area(the_hashmap);
+
+	for (;;) {
+		uint_fast32_t
+			end = (chunk += CHUNK_SZ),
+			start = end - CHUNK_SZ;
+		if (end > N_BUCKETS) {
+			end -= end - N_BUCKETS;
+		}
+		if (start >= N_BUCKETS) {
+			hashmap_area_release(the_hashmap, area);
+			return NULL;
+		}
+
+		for (uint_fast32_t idx = start; idx < end; ++idx) {
+			hashmap_key(&(idx), sizeof(idx), &(key));
+			if (hashmap_cas(
+				the_hashmap, area, &(key),
+				&(x), (void *)idx,
+				hashmap_cas_set, NULL
+			) == hashmap_cas_error) {
+				puts("error!");
+				exit(1);
+			}
+		}
+	}
+}
+
+void *readt(void *_) {
+	//while (!nolock) hashmap_mpause();
+
+	static atomic_uint_fast32_t chunk = 0;
+	static const uint_fast32_t CHUNK_SZ = 1024;
+
+	void *x;
+
+	struct hashmap_key key;
+
+	struct hashmap_area *area = hashmap_area(the_hashmap);
+
+	for (;;) {
+		uint_fast32_t
+			end = (chunk += CHUNK_SZ),
+			start = end - CHUNK_SZ;
+		if (end > N_BUCKETS) {
+			end -= end - N_BUCKETS;
+		}
+		if (start >= N_BUCKETS) {
+			hashmap_area_release(the_hashmap, area);
+			return NULL;
+		}
+
+		for (uint_fast32_t idx = start; idx < end; ++idx) {
+			hashmap_key(&(idx), sizeof(idx), &(key));
+			if (hashmap_cas(
+				the_hashmap, area, &(key),
+				&(x), NULL,
+				hashmap_cas_get, NULL
+			) != hashmap_cas_again) {
+				puts("error!");
+				exit(1);
+			}
+		}
+	}
+}
+
+void *deletet(void *_) {
+	while (nolock) hashmap_mpause();
+
+	static atomic_uint_fast32_t chunk = 0;
+	static const uint_fast32_t CHUNK_SZ = 1024;
+
+	void *x;
+
+	struct hashmap_key key;
+
+	struct hashmap_area *area = hashmap_area(the_hashmap);
+
+	int total = 0;
+
+	for (;;) {
+		uint_fast32_t
+			end = (chunk += CHUNK_SZ),
+			start = end - CHUNK_SZ;
+		if (end > N_BUCKETS) {
+			end -= end - N_BUCKETS;
+		}
+		if (start >= N_BUCKETS) {
+			hashmap_area_release(the_hashmap, area);
+			return NULL;
+		}
+
+		for (uint_fast32_t idx = start; idx < end; ++idx) {
+			hashmap_key(&(idx), sizeof(idx), &(key));
+			if (hashmap_cas(
+				the_hashmap, area, &(key),
+				&(x), NULL + 1 /* anything but NULL */,
+				hashmap_cas_delete, NULL
+			) == hashmap_cas_error) {
+				printf("error %lu\n", idx);
+				exit(1);
+			}
+		}
+	}
+}
+
 int main(int argc, char *argv[]) {
 	the_hashmap = hashmap_create(
-		N_THREADS, N_BUCKETS / 0.94, 1, 2,
+		N_THREADS, 25, 0.8,
 		NULL
 	);
 	if (the_hashmap == NULL) {
-		puts("error");
 		exit(1);
 	}
 
-	printf("writing %zu values...\n", N_BUCKETS);
-
+	double time;
 	pthread_t threads[N_THREADS];
-	struct gosh gosh[N_THREADS];
-	size_t idx = 0;
-	for (size_t x = 0; x < N_THREADS; ++x) {
-		gosh[x].idx = idx;
-		idx += (gosh[x].n = (N_BUCKETS / N_THREADS));
-		pthread_create(&(threads[x]), NULL, (void *)&(go), &(gosh[x]));
-	}
 
-	double time = rc();
+	printf("writing %u values...\n", N_BUCKETS);
 	for (size_t x = 0; x < N_THREADS; ++x) {
-		void *fuck;
-		pthread_join(threads[x], &(fuck));
+		pthread_create(&(threads[x]), NULL, (void *)&(writet), NULL);
 	}
-	printf("success! %lfs\nreading %zu values...\n", rc() - time, N_BUCKETS);
-
-	for (size_t x = 0; x < N_THREADS; ++x) {
-		pthread_create(&(threads[x]), NULL, (void *)&(readt), &(gosh[x]));
-	}
-
 	time = rc();
 	for (size_t x = 0; x < N_THREADS; ++x) {
 		void *fuck;
 		pthread_join(threads[x], &(fuck));
 	}
-	printf("success! %lfs\ndeleting %zu values...\n", rc() - time, N_BUCKETS);
+	printf("success! %lfs\n", rc() - time);
 
+	printf("reading %u values...\n", N_BUCKETS);
 	for (size_t x = 0; x < N_THREADS; ++x) {
-		pthread_create(&(threads[x]), NULL, (void *)&(deletet), &(gosh[x]));
+		pthread_create(&(threads[x]), NULL, (void *)&(readt), NULL);
 	}
+	//nolock = true;
+	time = rc();
+	for (size_t x = 0; x < N_THREADS; ++x) {
+		void *fuck;
+		pthread_join(threads[x], &(fuck));
+	}
+	printf("success! %lfs\n", rc() - time);
 
+	printf("deleting %u values...\n", N_BUCKETS);
+	for (size_t x = 0; x < N_THREADS; ++x) {
+		pthread_create(&(threads[x]), NULL, (void *)&(deletet), NULL);
+	}
+	nolock = false;
 	time = rc();
 	for (size_t x = 0; x < N_THREADS; ++x) {
 		void *fuck;

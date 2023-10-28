@@ -19,10 +19,10 @@
 #ifndef HASHMAP_H
 #define HASHMAP_H
 
-// this hashmap _can_ be very fast with
-// the right hash function. the only real
-// bottleneck here is malloc, which is used on
-// insert because you cannot enforce lifetimes in c.
+// this hashmap _can_ be very fast with the
+// right hash function. the only real bottleneck
+// here is malloc, which is used on insert
+// because you cannot enforce lifetimes in c.
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -45,7 +45,10 @@
 
 #include "ifc/ifc.h"
 
+#ifndef HASHMAP_MIN_RESERVE
 #define HASHMAP_MIN_RESERVE 24
+#endif
+
 enum hashmap_callback_reason {
 	hashmap_acquire,
 
@@ -109,43 +112,43 @@ struct hashmap_area {
 };
 
 struct hashmap {
-	_Atomic size_t reference_count;
+	const float resize_percentage;
 	const hashmap_callback callback;
 
-	struct hashmap_bucket *buckets;
-	uint32_t n_buckets;
-	_Atomic uint32_t occupied_buckets;
+	struct hashmap_bucket *_Atomic buckets;
+	atomic_uint_fast32_t n_buckets;
+	atomic_uint_fast32_t occupied_buckets;
 
-	const float
-		resize_percentage,
-		resize_multiply;
-		
+	atomic_size_t rc;
+	atomic_size_t writers;
+
 	// resize //
 
 	atomic_bool resize_fail;
 	atomic_bool resizing;
-	uint16_t threads_resizing;
+	atomic_uint_fast16_t threads_resizing;
 
-	_Atomic uint32_t init_idx;
-	_Atomic uint32_t resize_idx;
+	atomic_uint_fast32_t resize_idx;
 
 	pthread_mutex_t resize_mutex;
-	pthread_cond_t resize_cond;
-	pthread_mutex_t ensured_mutex;
-	pthread_cond_t ensured_cond;
+	atomic_bool main_thread_ready;
+	pthread_cond_t main_thread_maybe_ready_cond;
+	pthread_cond_t other_threads_maybe_ready_cond;
 	pthread_cond_t stop_resize_cond;
 
-	struct hashmap_bucket *new_buckets;
-	uint32_t new_n_buckets;
+	struct hashmap_bucket *_Atomic new_buckets;
+	atomic_uint_fast32_t new_n_buckets;
 
 	// ifc //
 
 	struct ifc *const ifc;
 };
 
-// *output_bucket will **always** be set to a locked hashmap bucket.
+static atomic_bool nolock = false;
+
+// *output_bucket will <b>always</b> be set to a locked hashmap bucket.
 // it is the caller's duty to release the bucket's lock once it is done using *output_bucket.
-static bool _hashmap_find(
+static __attribute__((always_inline)) inline bool _hashmap_find(
 	struct hashmap_bucket *buckets,
 	uint32_t n_buckets,
 
@@ -159,16 +162,16 @@ static bool _hashmap_find(
 	void *key = hm_key->key;
 	uint32_t key_sz = hm_key->key_sz;
 	uint32_t hash = hm_key->hash;
-	uint32_t bucket_idx = hm_key->hash % n_buckets;
+	uint32_t bucket_idx = hm_key->hash & (n_buckets - 1);
 
 	struct hashmap_bucket *sentinel = &(buckets[n_buckets]);
 
 	struct hashmap_bucket *bucket = &(buckets[bucket_idx]);
-	while (__atomic_test_and_set(&(bucket->lock), __ATOMIC_ACQUIRE)) {
+	while (!nolock && __atomic_test_and_set(&(bucket->lock), __ATOMIC_ACQUIRE)) {
 		hashmap_mpause();
 	}
 
-	for (size_t it = 0;; ++it) {
+	for (;;) {
 		struct hashmap_bucket_protected *protected = &(bucket->protected);
 		if (
 			protected->kv == NULL ||
@@ -191,10 +194,10 @@ static bool _hashmap_find(
 			next_bucket = buckets;
 		}
 
-		while (__atomic_test_and_set(&(next_bucket->lock), __ATOMIC_ACQUIRE)) {
+		while (!nolock && __atomic_test_and_set(&(next_bucket->lock), __ATOMIC_ACQUIRE)) {
 			hashmap_mpause();
 		}
-		__atomic_clear(&(bucket->lock), __ATOMIC_RELEASE);
+		if (!nolock) __atomic_clear(&(bucket->lock), __ATOMIC_RELEASE);
 
 		bucket = next_bucket;
 	}
@@ -256,7 +259,7 @@ static void _hashmap_resize(struct hashmap *hashmap, struct hashmap_area *area, 
 		buckets = hashmap->buckets;
 		n_buckets = hashmap->n_buckets;
 
-		new_n_buckets = n_buckets * hashmap->resize_multiply;
+		new_n_buckets = n_buckets << 1;
 		// allocate new buckets array
 		if (
 			(new_buckets = malloc(new_n_buckets * sizeof(struct hashmap_bucket))) == NULL
@@ -264,71 +267,71 @@ static void _hashmap_resize(struct hashmap *hashmap, struct hashmap_area *area, 
 			area->lock = true;
 			hashmap->resize_fail = true;
 			__atomic_clear(&(hashmap->resizing), __ATOMIC_RELEASE);
-			pthread_mutex_lock(&(hashmap->ensured_mutex));
-			pthread_cond_broadcast(&(hashmap->ensured_cond));
-			pthread_mutex_unlock(&(hashmap->ensured_mutex));
+			// some threads may be waiting for this thread to send a signal
+			pthread_mutex_lock(&(hashmap->resize_mutex));
+			pthread_cond_broadcast(&(hashmap->main_thread_maybe_ready_cond));
+			pthread_mutex_unlock(&(hashmap->resize_mutex));
 			return;
 		}
 		hashmap->new_buckets = new_buckets;
 		hashmap->new_n_buckets = new_n_buckets;
-		hashmap->init_idx = 0;
 		hashmap->resize_idx = 0;
 
-		// to-do: maybe make this concurrent
-		uint32_t n = new_n_buckets / *(unsigned int *)hashmap->ifc;
-		for (;;) {
-			uint32_t idx = (hashmap->init_idx += n) - n;
-			if (idx >= new_n_buckets) {
-				break;
-			}
-			if (idx + n >= new_n_buckets) {
-				n = new_n_buckets - idx;
-			}
-
-			for (uint32_t it = 0; it < n; ++it) {
-				struct hashmap_bucket *bucket = &(new_buckets[idx + it]);
-				__atomic_clear(&(bucket->lock), __ATOMIC_RELAXED);
-				bucket->protected.kv = NULL;
-			}
+		for (uint32_t idx = 0; idx < new_n_buckets; ++idx) {
+			struct hashmap_bucket *bucket = &(new_buckets[idx]);
+			__atomic_clear(&(bucket->lock), __ATOMIC_RELAXED);
+			bucket->protected.kv = NULL;
 		}
 
 		// wait for all other threads to
 		// leave non-resize critical sections
 		pthread_mutex_lock(&(hashmap->resize_mutex));
-		wait:;
+		hashmap->threads_resizing += 1;
+
 		// wait for other threads to stop working
+		wait:;
 		ifc_iter(struct hashmap_area)(hashmap->ifc, it_area) {
 			if (it_area->lock) {
-				pthread_cond_wait(&(hashmap->resize_cond), &(hashmap->resize_mutex));
+				pthread_cond_wait(&(hashmap->other_threads_maybe_ready_cond), &(hashmap->resize_mutex));
 				goto wait;
 			}
 		}
+
+		hashmap->main_thread_ready = true;
+		pthread_cond_broadcast(&(hashmap->main_thread_maybe_ready_cond));
 		pthread_mutex_unlock(&(hashmap->resize_mutex));
-		pthread_mutex_lock(&(hashmap->ensured_mutex));
-		assert(hashmap->threads_resizing == 0);
-		hashmap->threads_resizing = 1;
-		pthread_cond_broadcast(&(hashmap->ensured_cond));
-		pthread_mutex_unlock(&(hashmap->ensured_mutex));
 	} else {
 		pthread_mutex_lock(&(hashmap->resize_mutex));
-		pthread_cond_signal(&(hashmap->resize_cond));
-		pthread_mutex_unlock(&(hashmap->resize_mutex));
-		pthread_mutex_lock(&(hashmap->ensured_mutex));
-		while (hashmap->threads_resizing == 0) {
+
+		// resize_mutex required to change threads_resizing or to unset resizing
+		if (hashmap->resizing) {
+			pthread_cond_signal(&(hashmap->other_threads_maybe_ready_cond));
+			hashmap->threads_resizing += 1;
+		} else {
+			// q: what if a resize starts now and enters the critical section?
+			// a: it cannot enter the critical section because we hold hashmap->resize_mutex
+			assert(hashmap->threads_resizing == 0);
+			area->lock = true;
+			return;
+		}
+
+		if (!hashmap->main_thread_ready) {
+			pthread_cond_wait(&(hashmap->main_thread_maybe_ready_cond), &(hashmap->resize_mutex));
 			if (!hashmap->resizing) {
+				assert(hashmap->resize_fail);
+				hashmap->threads_resizing -= 1;
 				area->lock = true;
-				pthread_mutex_unlock(&(hashmap->ensured_mutex));
 				return;
 			}
-			pthread_cond_wait(&(hashmap->ensured_cond), &(hashmap->ensured_mutex));
+			assert(hashmap->main_thread_ready);
 		}
-		hashmap->threads_resizing += 1;
-		pthread_mutex_unlock(&(hashmap->ensured_mutex));
 
 		buckets = hashmap->buckets;
 		n_buckets = hashmap->n_buckets;
 		new_buckets = hashmap->new_buckets;
 		new_n_buckets = hashmap->new_n_buckets;
+
+		pthread_mutex_unlock(&(hashmap->resize_mutex));
 	}
 
 	// hashmap->threads_resizing != 0, so this is safe
@@ -386,17 +389,18 @@ static void _hashmap_resize(struct hashmap *hashmap, struct hashmap_area *area, 
 		}
 	}
 
-	pthread_mutex_lock(&(hashmap->ensured_mutex));
+	pthread_mutex_lock(&(hashmap->resize_mutex));
 	if (--hashmap->threads_resizing == 0) {
 		free(buckets);
 		hashmap->buckets = new_buckets;
 		hashmap->n_buckets = new_n_buckets;
+		hashmap->main_thread_ready = false;
 		pthread_cond_broadcast(&(hashmap->stop_resize_cond));
 		__atomic_clear(&(hashmap->resizing), __ATOMIC_RELEASE);
 	} else {
-		pthread_cond_wait(&(hashmap->stop_resize_cond), &(hashmap->ensured_mutex));
+		pthread_cond_wait(&(hashmap->stop_resize_cond), &(hashmap->resize_mutex));
 	}
-	pthread_mutex_unlock(&(hashmap->ensured_mutex));
+	pthread_mutex_unlock(&(hashmap->resize_mutex));
 
 	return;
 }
@@ -408,7 +412,7 @@ static size_t _hashmap_reserve(struct hashmap *hashmap, struct hashmap_area *are
 	}
 
 	uint32_t n_buckets = hashmap->n_buckets;
-	uint32_t capture = hashmap->occupied_buckets;
+	uint_fast32_t capture = hashmap->occupied_buckets;
 	uint32_t update;
 	do {
 		if (capture + n_reserve > n_buckets * hashmap->resize_percentage && !hashmap->resize_fail) {
@@ -440,7 +444,7 @@ static inline void _hashmap_not_running(struct hashmap *hashmap, struct hashmap_
 	if (hashmap->resizing) {
 		// to-do: maybe assist?
 		pthread_mutex_lock(&(hashmap->resize_mutex));
-		pthread_cond_signal(&(hashmap->resize_cond));
+		pthread_cond_signal(&(hashmap->other_threads_maybe_ready_cond));
 		pthread_mutex_unlock(&(hashmap->resize_mutex));
 	}
 	return;
@@ -459,7 +463,10 @@ static void hashmap_key(
 	output_key->key = key;
 	output_key->key_sz = key_sz;
 
+	#pragma clang diagnostic push
+	#pragma clang diagnostic ignored "-Wimplicit-function-declaration"
 	output_key->hash = HASHMAP_HASH_FUNCTION(key, key_sz);
+	#pragma clang diagnostic pop
 
 	return;
 }
@@ -551,7 +558,7 @@ static enum hashmap_cas_result hashmap_cas(
 
 	cas:;
 	#define _hashmap_cas_leave_critical_section() do { \
-		__atomic_clear(&(bucket->lock), __ATOMIC_RELEASE); \
+		if (!nolock) __atomic_clear(&(bucket->lock), __ATOMIC_RELEASE); \
 		_hashmap_not_running(hashmap, area); \
 	} while (0);
 
@@ -601,6 +608,7 @@ static enum hashmap_cas_result hashmap_cas(
 					break;
 				}
 				bucket->protected = next_bucket->protected;
+				bucket->protected.psl -= 1;
 				__atomic_clear(&(bucket->lock), __ATOMIC_RELEASE);
 				bucket = next_bucket;
 			}
@@ -682,32 +690,31 @@ static enum hashmap_cas_result hashmap_cas(
 
 static struct hashmap *hashmap_create(
 	uint16_t n_threads,
-	uint32_t initial_size,
+	uint8_t initial_size_log2,
 	float resize_percentage,
-	float resize_multiply,
 
 	hashmap_callback callback
 ) {
 	if (n_threads == 0) {
 		return NULL;
 	}
+
+	uint32_t initial_size = 1 << initial_size_log2;
+
 	if (resize_percentage <= 0 || resize_percentage > 1) {
 		resize_percentage = 0.94;
 	}
-	if (resize_multiply <= 1) {
-		resize_multiply = 2;
+
+	uint32_t min = (uint32_t)((float)HASHMAP_MIN_RESERVE / resize_percentage) + 1;
+	if (min < n_threads + 1) {
+		min = n_threads + 1;
 	}
+	uint32_t lz = __builtin_clz((min | 1) - 1);
+	min = 1 << (32 - lz);
 
-	size_t n_buckets = n_threads + 1;
-
-	float _min = HASHMAP_MIN_RESERVE / resize_percentage;
-	uint32_t min = ((uint32_t)_min + (_min == (uint32_t)_min ? 0 : 1));
-
-	if (initial_size < min) {
-		initial_size = min;
-	}
-	if (n_buckets < initial_size) {
-		n_buckets = initial_size;
+	uint32_t n_buckets = 1 << initial_size_log2;
+	if (n_buckets < min) {
+		n_buckets = min;
 	}
 
 	struct hashmap *hashmap = malloc(sizeof(struct hashmap));
@@ -731,27 +738,22 @@ static struct hashmap *hashmap_create(
 		ifc_free(hashmap->ifc);
 		goto err2;
 	}
-	if (pthread_cond_init(&(hashmap->resize_cond), NULL) != 0) {
+	if (pthread_cond_init(&(hashmap->other_threads_maybe_ready_cond), NULL) != 0) {
 		err4:;
 		pthread_mutex_destroy(&(hashmap->resize_mutex));
 		goto err3;
 	}
-	if (pthread_mutex_init(&(hashmap->ensured_mutex), NULL) != 0) {
+	if (pthread_cond_init(&(hashmap->main_thread_maybe_ready_cond), NULL) != 0) {
 		err5:;
-		pthread_cond_destroy(&(hashmap->resize_cond));
+		pthread_cond_destroy(&(hashmap->other_threads_maybe_ready_cond));
 		goto err4;
 	}
-	if (pthread_cond_init(&(hashmap->ensured_cond), NULL) != 0) {
-		err6:;
-		pthread_mutex_destroy(&(hashmap->ensured_mutex));
+	if (pthread_cond_init(&(hashmap->stop_resize_cond), NULL) != 0) {
+		pthread_cond_destroy(&(hashmap->main_thread_maybe_ready_cond));
 		goto err5;
 	}
-	if (pthread_cond_init(&(hashmap->stop_resize_cond), NULL) != 0) {
-		pthread_cond_destroy(&(hashmap->resize_cond));
-		goto err6;
-	}
 
-	hashmap->reference_count = 1;
+	hashmap->rc = 1;
 
 	*(hashmap_callback *)&(hashmap->callback) = callback;
 
@@ -762,11 +764,10 @@ static struct hashmap *hashmap_create(
 		buckets[idx].protected.kv = NULL;
 		__atomic_clear(&(buckets[idx].lock), __ATOMIC_RELAXED);
 	}
-
-	*(float *)&(hashmap->resize_percentage) = resize_percentage;
-	*(float *)&(hashmap->resize_multiply) = resize_multiply;
-
+		
 	// resize
+	*(float *)&(hashmap->resize_percentage) = resize_percentage;
+	__atomic_clear(&(hashmap->main_thread_ready), __ATOMIC_RELAXED);
 	__atomic_clear(&(hashmap->resize_fail), __ATOMIC_RELAXED);
 	__atomic_clear(&(hashmap->resizing), __ATOMIC_RELAXED);
 	hashmap->threads_resizing = 0;
@@ -781,16 +782,15 @@ static struct hashmap *hashmap_create(
 }
 
 static struct hashmap *hashmap_copy_ref(struct hashmap *hashmap) {
-	hashmap->reference_count += 1;
+	hashmap->rc += 1;
 	return hashmap;
 }
 
 static void hashmap_destroy(struct hashmap *hashmap) {
-	if (--hashmap->reference_count == 0) {
+	if (--hashmap->rc == 0) {
 		pthread_cond_destroy(&(hashmap->stop_resize_cond));
-		pthread_cond_destroy(&(hashmap->resize_cond));
-		pthread_mutex_destroy(&(hashmap->ensured_mutex));
-		pthread_cond_destroy(&(hashmap->resize_cond));
+		pthread_cond_destroy(&(hashmap->other_threads_maybe_ready_cond));
+		pthread_cond_destroy(&(hashmap->main_thread_maybe_ready_cond));
 		pthread_mutex_destroy(&(hashmap->resize_mutex));
 
 		ifc_free(hashmap->ifc);
